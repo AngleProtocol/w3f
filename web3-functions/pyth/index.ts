@@ -90,7 +90,6 @@ async function getLastPrices(priceIds: string[], storage: any) {
     })
   )).filter((p) => p.storedValue !== void 0).reduce((acc, priceInfo) => {
     const price = Price.fromJson(JSON.parse(priceInfo.storedValue));
-    const expo = priceInfo.storedValue.expo;
     acc.set(priceInfo.priceId, price);
     return acc;
   }, /* @__PURE__ */ new Map());
