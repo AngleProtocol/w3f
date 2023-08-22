@@ -11,6 +11,10 @@ import { Octokit } from "octokit";
 import YAML from "yaml";
 import { Price } from "@pythnetwork/pyth-evm-js";
 
+const ORACLE_ABI = [
+  "function getPriceUnsafe(bytes32) view returns (tuple(int64,uint64,int32,uint256))",
+];
+
 function addLeading0x(id: string) {
   if (id.startsWith("0x")) {
     return id;
@@ -82,17 +86,99 @@ async function getCurrentPrices(priceIds: string[], connection: any, debug: bool
   }, /* @__PURE__ */ new Map());
 }
 
-async function getLastPrices(priceIds: string[], storage: any) {
-  return (await Promise.all(
-    priceIds.map(async (priceId) => {
-      const storedValue = await storage.get(priceId);
-      return { priceId, storedValue };
-    })
-  )).filter((p) => p.storedValue !== void 0).reduce((acc, priceInfo) => {
-    const price = Price.fromJson(JSON.parse(priceInfo.storedValue));
-    acc.set(priceInfo.priceId, price);
-    return acc;
-  }, /* @__PURE__ */ new Map());
+async function getLastPricesFromChain(provider: any, oracleAddress: string, priceIds: string[], ) {
+  let result = new Map();
+  let oracle;
+  for (const priceId of priceIds) {
+    oracle = new Contract(oracleAddress, ORACLE_ABI, provider);
+    const priceInfo = await oracle.getPriceUnsafe(priceId);
+    // decode result
+    const price = priceInfo[0].toString();
+    const expo = parseInt(priceInfo[2].toString());
+    const publishTime = parseInt(priceInfo[3].toString());
+    const priceInfoJson = {
+      price,
+      expo,
+      publishTime
+    }
+    result.set(priceId, priceInfoJson);
+  }
+  return result;
+}
+
+function generatePriceUpdateList(
+  priceIds: any,
+  currentPrices: any,
+  lastPrices: any,
+  allPriceIdsByItem: { [key: string]: string[] },
+  validTimePeriodSeconds: number,
+  deviationThresholdBps: number,
+  debug: boolean
+): string[] {
+
+  const priceUpdateList: string[] = [];
+
+  for (const item of Object.keys(priceIds)) {
+    let composedLastPrice = 0;
+    let composedCurrentPrice = 0;
+    const priceIdObj = priceIds[item];
+    for (const priceFeed of priceIdObj) {
+      const priceId = addLeading0x(priceFeed.id);
+      const currentPrice = currentPrices.get(priceId);
+      const lastPrice = lastPrices.get(priceId);
+
+      if (currentPrice.publishTime - lastPrice.publishTime > validTimePeriodSeconds) {
+        // Price is stale --> update all oracles for this item
+        for (const priceId of allPriceIdsByItem[item]) {
+          priceUpdateList.push(priceId);
+        }
+        if (debug) {
+          console.debug(`
+            Updating all prices for item: ${item}
+            PriceIds: ${allPriceIdsByItem[item]}
+          `);
+        }
+        break;
+      }
+
+      if (composedLastPrice === 0 && composedCurrentPrice == 0) {
+        composedLastPrice = lastPrices.get(priceId).price * (10 ** lastPrices.get(priceId).expo);
+        composedCurrentPrice =  currentPrices.get(priceId).price * (10 ** currentPrices.get(priceId).expo);
+      } else {
+          if (priceFeed.action === "div") {
+            composedLastPrice =  composedLastPrice /  (lastPrices.get(priceId).price * (10 ** lastPrices.get(priceId).expo));
+            composedCurrentPrice =  composedCurrentPrice /  (currentPrices.get(priceId).price * (10 ** currentPrices.get(priceId).expo));
+          } else if (priceFeed.action === "mul") {
+            composedLastPrice =  composedLastPrice *  (lastPrices.get(priceId).price * (10 ** lastPrices.get(priceId).expo));
+            composedCurrentPrice =  composedCurrentPrice *  (currentPrices.get(priceId).price * (10 ** currentPrices.get(priceId).expo));
+          } else {
+            throw new Error(`Invalid action: ${priceFeed.action}`);
+          }
+      }
+    }
+    let composedPriceDiff = composedLastPrice - composedCurrentPrice;
+    composedPriceDiff = composedPriceDiff < 0 ? -composedPriceDiff : composedPriceDiff;
+    composedPriceDiff *= 1e4;
+    composedPriceDiff /= composedLastPrice;
+    const priceExceedsDiff = composedPriceDiff >= deviationThresholdBps;
+
+    if (debug) {
+      console.debug(`
+        item: ${item}
+        composedPriceIds: ${allPriceIdsByItem[item]}
+        composedPriceDiff: ${composedPriceDiff}
+        priceExceedsDiff: ${priceExceedsDiff}
+      `);
+    }
+
+    if (priceExceedsDiff) {
+      for (const priceId of allPriceIdsByItem[item]) {
+        priceUpdateList.push(priceId);
+      }
+    }
+  }
+
+  return [...new Set(priceUpdateList)];
 }
 
 // web3-functions/pyth-oracle-w3f-priceIds/index.ts
@@ -130,8 +216,6 @@ Web3Function.onRun(async (context) => {
     validTimePeriodSeconds,
     deviationThresholdBps,
     priceIds,
-    composedDeviationThresholdBps,
-    composedPriceIds
   } = pythConfig;
   const pythContract = new Contract(
     pythNetworkAddress,
@@ -141,27 +225,23 @@ Web3Function.onRun(async (context) => {
 
   const connection = new EvmPriceServiceConnection2(priceServiceEndpoint);
   
-
   // Add composed PriceFeeds to priceIds
-  const allComposedPriceIds: string[] = [];
-  const allPriceIds: string[] = []
+  const allPriceIdsByItem: { [key: string]: string[] } = {}
 
-  if (priceIds) {
-    for (const priceId of priceIds) {
-      allPriceIds.push(addLeading0x(priceId));
+  for (const item of Object.keys(priceIds)) {
+    const priceIdObj = priceIds[item];
+
+    if (!allPriceIdsByItem.hasOwnProperty(item)) {
+      allPriceIdsByItem[item] = [];
     }
+
+    for (const priceFeed of priceIdObj) {
+      allPriceIdsByItem[item].push(addLeading0x(priceFeed.id));
+    } 
   }
 
-  if (composedPriceIds) {
-    for (const composedPriceId of composedPriceIds) {
-      for (const priceId of composedPriceId) {
-        allComposedPriceIds.push(addLeading0x(priceId));
-        if (!allPriceIds.includes(priceId)) {
-          allPriceIds.push(addLeading0x(priceId));
-        }
-      }
-    }
-  }
+  // Generate a list of unique priceIds to fetch current and last prices
+  const allPriceIds = [...new Set(Object.values(allPriceIdsByItem).flat())];
 
   if (debug) {
     console.debug(`fetching current prices for priceIds: ${allPriceIds}`);
@@ -182,7 +262,8 @@ Web3Function.onRun(async (context) => {
     );
     return { canExec: false, message: "Not all prices available" };
   }
-  const lastPrices = await getLastPrices(allPriceIds, storage);
+
+  const lastPrices = await getLastPricesFromChain(provider, pythNetworkAddress, allPriceIds);
   
   if (debug) {
     console.debug(
@@ -193,121 +274,17 @@ Web3Function.onRun(async (context) => {
     );
   }
 
-  // Composed price feed needs update
-  const composedPriceFeedNeedsUpdate = (composedPriceIds: string[][]) => {
-    // Update all oracles if one of them needs update
-    let composedLastPrice = 0;
-    let composedCurrentPrice = 0;
-    let priceIsStale = false;
-    for (const priceId of composedPriceIds) {
-      // Update the pricefeed if we don't have the last price in storage
-      if (lastPrices.get(priceId) === void 0) {
-        console.log("Price needs to be loaded into storage")
-        return true;
-      }
-      
-      const currentPrice = currentPrices.get(priceId);
-      const lastPrice = lastPrices.get(priceId);
-
-      if (composedLastPrice === 0) {
-        composedLastPrice = lastPrices.get(priceId).price * (10 ** lastPrices.get(priceId).expo);
-      } else {
-        composedLastPrice =  composedLastPrice /  (lastPrices.get(priceId).price * (10 ** lastPrices.get(priceId).expo));
-      }
-
-      if (composedCurrentPrice === 0) {
-        composedCurrentPrice =  currentPrices.get(priceId).price * (10 ** currentPrices.get(priceId).expo);
-      } else {
-        composedCurrentPrice = composedCurrentPrice /  (currentPrices.get(priceId).price * (10 ** currentPrices.get(priceId).expo));
-      }
-
-      
-
-      if (currentPrice.publishTime - lastPrice.publishTime > validTimePeriodSeconds) {
-        // Don't need to check for the rest of the oracles or the price difference, we will update anyways
-        priceIsStale = true;
-        return true;
-      }
-    }
-
-    let composedPriceDiff = composedLastPrice - composedCurrentPrice;
-    composedPriceDiff = composedPriceDiff < 0 ? -composedPriceDiff : composedPriceDiff;
-    composedPriceDiff *= 1e4;
-    composedPriceDiff /= composedLastPrice;
-    const priceExceedsDiff = composedPriceDiff >= composedDeviationThresholdBps;
-
-    if (debug) {
-      console.debug(`
-        composedPriceId: ${composedPriceIds}
-        composedPriceDiff: ${composedPriceDiff}
-        priceExceedsDiff: ${priceExceedsDiff}
-        priceIsStale: ${priceIsStale}
-      `);
-    }
-
-    return priceExceedsDiff;
-  }
-
-  // Price feed needs update
-  const priceFeedNeedsUpdate = (priceId: string) => {
-    const lastPrice = lastPrices.get(priceId);
-    // Update the pricefeed if we don't have the last price in storage
-    if (lastPrice === void 0) {
-      return true;
-    }
-    const currentPrice = currentPrices.get(priceId);
-    let priceDiff = BigInt(lastPrice.price) - BigInt(currentPrice.price);
-    priceDiff = priceDiff < 0 ? -priceDiff : priceDiff;
-    priceDiff *= BigInt(1e4);
-    priceDiff /= BigInt(lastPrice.price);
-
-    const priceExceedsDiff = priceDiff >= deviationThresholdBps;
-    const priceIsStale = currentPrice.publishTime - lastPrice.publishTime > validTimePeriodSeconds;
-    if (debug) {
-      console.debug(`
-        priceId: ${priceId}
-        priceDiff: ${priceDiff}
-        priceExceedsDiff: ${priceExceedsDiff}
-        priceIsStale: ${priceIsStale}
-      `);
-    }
-    return priceExceedsDiff || priceIsStale;
-  };
-
-  const priceIdsToUpdate: string[] = [];
-
-  // Adding composed prices to priceIdsToUpdate
-  if (composedPriceIds) {
-    for (const composedPriceId of composedPriceIds) {
-      if (composedPriceFeedNeedsUpdate(composedPriceId)) {
-        for (const priceId of composedPriceId) {
-          priceIdsToUpdate.push(priceId);
-        }
-      }
-    }
-  }
-
-  // Adding normal prices to priceIdsToUpdate
-  if (priceIds) {
-    for (const priceId of priceIds) {
-      if (priceFeedNeedsUpdate(priceId)) {
-        if (!priceIdsToUpdate.includes(priceId)) {
-          priceIdsToUpdate.push(priceId);
-        }
-      }
-    }
-  }
-
+  const priceIdsToUpdate = generatePriceUpdateList(
+    priceIds,
+    currentPrices,
+    lastPrices,
+    allPriceIdsByItem,
+    validTimePeriodSeconds,
+    deviationThresholdBps,
+    debug
+  );
 
   if (priceIdsToUpdate.length > 0) {
-    await Promise.all(
-      priceIdsToUpdate.map(async (priceId) => {
-        const storageValue = JSON.stringify(
-          currentPrices.get(priceId)?.toJson()
-        );
-        await storage.set(priceId, storageValue);
-      })
-    );
     const publishTimes = priceIdsToUpdate.map(
       (priceId) => currentPrices.get(priceId).publishTime
     );
