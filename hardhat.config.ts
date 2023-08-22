@@ -32,7 +32,7 @@ const config: HardhatUserConfig = {
   w3f: {
     rootDir: "./web3-functions",
     debug: false,
-    networks: ["mumbai", "goerli", "baseGoerli"], //(multiChainProvider) injects provider for these networks
+    networks: ["mumbai", "goerli", "baseGoerli", "ethereum"], //(multiChainProvider) injects provider for these networks
   },
 
   namedAccounts: {
