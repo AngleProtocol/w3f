@@ -129,8 +129,9 @@ function generatePriceUpdateList(
 
       if (currentPrice.publishTime - lastPrice.publishTime > validTimePeriodSeconds) {
         // Price is stale --> update all oracles for this item
-        for (const priceId of allPriceIdsByItem[item]) {
-          priceUpdateList.push(priceId);
+        for (const price of allPriceIdsByItem[item]) {
+          // We might push duplicates, they'll be filtered out later
+          priceUpdateList.push(price);
         }
         if (debug) {
           console.debug(`
@@ -172,8 +173,8 @@ function generatePriceUpdateList(
     }
 
     if (priceExceedsDiff) {
-      for (const priceId of allPriceIdsByItem[item]) {
-        priceUpdateList.push(priceId);
+      for (const price of allPriceIdsByItem[item]) {
+        priceUpdateList.push(price);
       }
     }
   }
